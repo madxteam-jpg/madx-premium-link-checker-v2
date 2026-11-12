@@ -1050,7 +1050,7 @@ st.set_page_config(
 # Header Row with Manual Refresh Option
 head_col1, head_col2 = st.columns([4, 1])
 with head_col1:
-  st.title("🔗 Enterprise Link Building QA Dashboard")
+  st.title("🔗 MADX Link Building QA")
 with head_col2:
   st.write("")
   if st.button("🔄 Refresh ClickUp Cache", use_container_width=True):
