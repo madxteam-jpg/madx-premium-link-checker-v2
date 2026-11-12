@@ -764,7 +764,7 @@ def generate_pdf_report(
 
   # Header
   elements.append(
-      Paragraph("<b>Enterprise Link Building QA Audit</b>", title_style)
+      Paragraph("<b>MADX Link Building QA Audit</b>", title_style)
   )
   elements.append(
       Paragraph(
@@ -1044,7 +1044,7 @@ def generate_pdf_report(
 
 # --- 7. STREAMLIT FRONT-END DASHBOARD UI ---
 st.set_page_config(
-    page_title="Enterprise Link Building QA", page_icon="🔗", layout="wide"
+    page_title="MADX Link Building QA", page_icon="🔗", layout="wide"
 )
 
 # Header Row with Manual Refresh Option
