@@ -176,13 +176,7 @@ def validate_clickup_duplicates(
 
 # --- 3. CORE BACKEND HELPERS & SCRAPERS ---
 def fetch_url_content(url):
-  """Multi-stage scraper pipeline:
-
-  1. ScrapingAnt via standard 'requests'
-  2. Direct Chrome TLS impersonation via curl_cffi
-  3. Cloudscraper engine
-  4. Jina Reader mirror fallback
-  """
+  """Multi-stage scraper pipeline."""
   if SCRAPERANT_KEY:
     try:
       encoded_url = quote(url, safe="")
@@ -386,7 +380,7 @@ def check_link_and_tags(page_url, target_url, expected_anchor, brand_name):
 
 # --- 4. GOOGLE GEMINI AI RELEVANCY AGENT ---
 def analyze_relevancy_with_gemini(page_html, target_niche, business_topic):
-  """Uses Gemini Flash to evaluate domain niche and topic alignment rules."""
+  """Uses Gemini 3.8 Flash to evaluate domain niche and topic alignment rules."""
   if not gemini_client:
     return {
         "niche_pass": "Error",
@@ -421,7 +415,7 @@ def analyze_relevancy_with_gemini(page_html, target_niche, business_topic):
         2. Topic Relevancy: Does this theme make semantic sense to mention '{business_topic}'?
         """
     response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=prompt,
         config=genai.types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -530,7 +524,6 @@ def generate_pdf_report(
   )
   styles = getSampleStyleSheet()
 
-  # Typography Styles
   title_style = ParagraphStyle(
       "ReportTitle",
       parent=styles["Heading1"],
@@ -850,7 +843,6 @@ with st.form("qa_form"):
   st.subheader("📋 Input Specifications")
   col1, col2 = st.columns(2)
   with col1:
-    # Client Folder dropdown directly fed from ClickUp
     if client_folders:
       selected_client = st.selectbox(
           "Client ClickUp Folder",
@@ -877,7 +869,7 @@ with st.form("qa_form"):
   submitted = st.form_submit_button("Execute Full System QA Audit")
 
 
-# --- 8. UNIFIED FORM SUBMISSION LOOP ---
+# --- 8. UNIFIED FORM SUBMISSION & ALL-IN-ONE REPORT VIEW ---
 if submitted:
   if not page_url or not target_url or not selected_client:
     st.error(
@@ -905,67 +897,85 @@ if submitted:
     ):
       ahrefs_results = fetch_advanced_ahrefs_data(page_url)
 
-    # STEP 4: Gemini Contextual AI
+    # STEP 4: Gemini 3.8 Flash Contextual AI
     with st.spinner(
         "Step 4/4: Running contextual semantic relevancy audits via Gemini"
-        " Flash..."
+        " 3.8-flash..."
     ):
       ai_relevancy = analyze_relevancy_with_gemini(
           qa_results.get("html_content", ""), target_niche, business_topic
       )
 
     st.markdown("---")
-    st.subheader("📊 Live QA Verification Report")
-
-    # High-level Metrics Header
-    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    with m_col1:
-      dupe_status = "Unique ✅" if clickup_check["is_passed"] else "Conflict ❌"
-      st.metric(label="ClickUp Uniqueness", value=dupe_status)
-    with m_col2:
-      st.metric(label="Domain Rating", value=f"DR {ahrefs_results['dr']}")
-    with m_col3:
-      status = "Indexable" if qa_results["is_indexable"] else "NoIndex ❌"
-      st.metric(label="Crawler Index Status", value=status)
-    with m_col4:
-      brand_status = "Found" if qa_results["brand_mentioned"] else "Missing"
-      st.metric(label="Brand Placement Check", value=brand_status)
+    st.subheader("📊 Full System QA Verification Report")
 
     if qa_results["error"]:
       st.error(f"System Blocked: {qa_results['error']}")
 
-    # Detailed Tabs
-    tab0, tab1, tab2, tab3 = st.tabs([
-        "📁 ClickUp Duplicate Audit",
-        "🔒 Technical Placement & Compliance",
-        "📈 Ahrefs Sitewide Metrics Profile",
-        "🧠 Semantic AI Relevancy",
-    ])
+    # =========================================================================
+    # SECTION 1: Audit Input Specifications & High-Level Summary
+    # =========================================================================
+    with st.container(border=True):
+      st.markdown(
+          "### 1️⃣ Audit Input Specifications & High-Level Summary"
+      )
 
-    with tab0:
-      st.markdown("### 📁 ClickUp Partner Link Verification")
+      # 4 Scorecard Metrics
+      sm1, sm2, sm3, sm4 = st.columns(4)
+      with sm1:
+        dupe_val = "PASS (Unique)" if clickup_check["is_passed"] else "FAIL (Conflict)"
+        st.metric(label="ClickUp Uniqueness", value=dupe_val)
+      with sm2:
+        st.metric(label="Domain Rating", value=f"DR {ahrefs_results['dr']}")
+      with sm3:
+        status = "Indexable" if qa_results["is_indexable"] else "NoIndex ❌"
+        st.metric(label="Crawler Index Status", value=status)
+      with sm4:
+        brand_status = "Found" if qa_results["brand_mentioned"] else "Missing"
+        st.metric(label="Brand Placement", value=brand_status)
+
+      st.markdown("#### Input Target Context")
+      spec_col1, spec_col2 = st.columns(2)
+      with spec_col1:
+        st.markdown(f"**Client Folder:** `{selected_client}`")
+        st.markdown(f"**Live Page URL:** [{page_url}]({page_url})")
+        st.markdown(f"**Target Landing URL:** [{target_url}]({target_url})")
+      with spec_col2:
+        st.markdown(f"**Customer Brand Name:** `{brand_name or 'N/A'}`")
+        st.markdown(f"**Expected Anchor Text:** `{anchor_text or 'N/A'}`")
+        st.markdown(
+            f"**Target Niche / Topic:** `{target_niche or 'N/A'}` /"
+            f" `{business_topic or 'N/A'}`"
+        )
+
+    # =========================================================================
+    # SECTION 2: ClickUp Database Uniqueness Audit
+    # =========================================================================
+    with st.container(border=True):
+      st.markdown("### 2️⃣ ClickUp Database Uniqueness Audit")
+
       if clickup_check["is_passed"]:
         st.success(
             f"✅ **Clear to place!** Domain `{clickup_check['target_domain']}`"
-            f" has not been used for client **{selected_client}**, and this"
-            " exact URL does not exist in your ClickUp database."
+            f" has not been used for client **{selected_client}**, and this exact"
+            " URL does not exist in your ClickUp database."
         )
       else:
         if clickup_check["exact_url_matches"]:
           st.error(
               "🚨 **Exact URL Duplicate Found!** This URL has already been"
-              f" placed in ClickUp ({len(clickup_check['exact_url_matches'])}"
+              f" logged in ClickUp ({len(clickup_check['exact_url_matches'])}"
               " time[s]):"
           )
           for match in clickup_check["exact_url_matches"]:
             st.markdown(
-                f"- **Task:** [{match['task_name']}]({match['task_url']})  \n "
-                f" **Client Folder:** `{match['client_name']}`"
+                f"- **Task:** [{match['task_name']}]({match['task_url']}) |"
+                f" **Folder:** `{match['client_name']}`"
             )
 
         if clickup_check["same_client_domain_matches"]:
           st.error(
-              f"⚠️ **Client Domain Conflict:** The domain"
+              f"⚠️ **Client Domain Conflict:** The root domain"
               f" `{clickup_check['target_domain']}` is already used for client"
               f" **{selected_client}**."
           )
@@ -976,70 +986,84 @@ if submitted:
                 f" **Folder:** `{match['client_name']}`"
             )
 
-    with tab1:
-      st.markdown("### 🔍 Live URL Footprint Guardrails")
-      if qa_results["is_redirecting"]:
-        st.warning(
-            "⚠️ **Redirect Alert:** Destination resolved at:"
-            f" `{qa_results['final_destination_url']}`"
-        )
-      else:
-        st.success("✅ **Redirect Check:** Clean direct destination.")
+    # =========================================================================
+    # SECTION 3: Technical Placement & Compliance Audit
+    # =========================================================================
+    with st.container(border=True):
+      st.markdown("### 3️⃣ Technical Placement & Compliance Audit")
 
-      if qa_results["is_ugc"]:
-        st.error(
-            "❌ **UGC Structural Risk:** Comment layout detected! Reason:"
-            f" *{qa_results['ugc_reason']}*"
-        )
-      else:
-        st.success(
-            "✅ **UGC Profile Check:** Clean editorial article layout verified."
-        )
-
-      st.markdown("---")
-      st.markdown("### 🔗 Hyperlink Node Verification")
-      if qa_results["link_found"]:
-        st.success(
-            "✅ **Link Footprint:** Target backlink anchor node discovered in"
-            " page source."
-        )
-        if qa_results["anchor_matches"]:
-          st.success(
-              f"✅ **Anchor Framework:** Matches expected string"
-              f" *'{anchor_text}'*"
-          )
-        else:
+      tcol1, tcol2 = st.columns(2)
+      with tcol1:
+        st.markdown("**Page Level Integrity**")
+        if qa_results["is_redirecting"]:
           st.warning(
-              "⚠️ **Anchor Discrepancy:** Backlink node found, but anchor text"
-              " mismatches."
+              "⚠️ **Redirect Alert:** Destination resolved at:"
+              f" `{qa_results['final_destination_url']}`"
           )
-        if qa_results["is_follow"]:
-          st.success("✅ **Link Attribution:** DoFollow attribute verified.")
         else:
-          st.error(
-              "❌ **Link Attribute Error:** Contains indexing restriction"
-              f" flags: `{qa_results['rel_tags']}`"
-          )
-      else:
-        st.error(
-            "❌ **Link Asset Missing:** Target destination string was not"
-            " found inside page anchor elements."
-        )
+          st.success("✅ **Redirect Check:** Clean direct destination.")
 
-    with tab2:
-      st.markdown("### 📊 Sitewide Authority Metrics")
+        if qa_results["is_ugc"]:
+          st.error(
+              f"❌ **UGC Risk Detected:** {qa_results['ugc_reason']}"
+          )
+        else:
+          st.success("✅ **Layout Check:** Editorial article layout verified.")
+
+        if qa_results["is_indexable"]:
+          st.success("✅ **Meta Robots:** Page is indexable by crawlers.")
+        else:
+          st.error("❌ **Meta Robots:** `noindex` tag detected!")
+
+      with tcol2:
+        st.markdown("**Backlink & Node Verification**")
+        if qa_results["link_found"]:
+          st.success("✅ **Anchor Node Found:** Target backlink present in DOM.")
+          if qa_results["anchor_matches"]:
+            st.success(f"✅ **Anchor String:** Matches '{anchor_text}'")
+          else:
+            st.warning("⚠️ **Anchor String Discrepancy:** Anchor text mismatch.")
+
+          if qa_results["is_follow"]:
+            st.success("✅ **Attribution:** DoFollow link verified.")
+          else:
+            st.error(
+                f"❌ **Link Restricted:** Rel attributes: `{qa_results['rel_tags']}`"
+            )
+        else:
+          st.error("❌ **Backlink Missing:** Target destination string was not found.")
+
+      # Ahrefs Sitewide Metrics Chart
       if ahrefs_results["traffic_history"]:
+        st.markdown("#### 📈 Sitewide Authority Organic Trend (Ahrefs)")
         dates = [i.get("date") for i in ahrefs_results["traffic_history"]]
         traffic = [
             i.get("org_traffic", 0) for i in ahrefs_results["traffic_history"]
         ]
         st.line_chart(data=dict(zip(dates, traffic)))
-      else:
-        st.info("No historical traffic data available for this domain.")
 
-    with tab3:
-      st.markdown("### 🧠 Contextual AI Evaluation Log")
-      st.info(f"🤖 **AI Auditor Reasoning:** {ai_relevancy['reason']}")
+    # =========================================================================
+    # SECTION 4: Semantic AI Relevancy Audit (Gemini Evaluation)
+    # =========================================================================
+    with st.container(border=True):
+      st.markdown(
+          "### 4️⃣ Semantic AI Relevancy Audit (Gemini Evaluation — gemini-3.8-flash)"
+      )
+
+      r_col1, r_col2 = st.columns(2)
+      with r_col1:
+        if ai_relevancy.get("niche_pass") == "PASS":
+          st.success(f"✅ **Niche Relevancy:** PASS ({target_niche})")
+        else:
+          st.error(f"❌ **Niche Relevancy:** FAIL ({target_niche})")
+
+      with r_col2:
+        if ai_relevancy.get("topic_pass") == "PASS":
+          st.success(f"✅ **Topic Alignment:** PASS ({business_topic})")
+        else:
+          st.error(f"❌ **Topic Alignment:** FAIL ({business_topic})")
+
+      st.info(f"🤖 **AI Auditor Reasoning Log:**\n\n{ai_relevancy['reason']}")
 
     # --- DOWNLOAD REPORT BUTTON ---
     st.markdown("---")
