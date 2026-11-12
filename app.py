@@ -27,6 +27,7 @@ import tldextract
 # --- 1. SECURE API CONFIGURATION KEYS ---
 AHREFS_API_KEY = st.secrets.get("AHREFS_API_KEY", "")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 SCRAPERANT_KEY = st.secrets.get("SCRAPERANT_KEY", "")
 
 # ClickUp Configuration
@@ -42,8 +43,15 @@ CLICKUP_HEADERS = {
     "Content-Type": "application/json",
 }
 
-# Initialize Gemini Client
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Initialize Gemini Client with 20-second timeout
+gemini_client = (
+    genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options={"timeout": 20000},
+    )
+    if GEMINI_API_KEY
+    else None
+)
 
 
 # --- 2. URL & STRICT CLICKUP DATABASE HELPERS ---
@@ -67,11 +75,7 @@ def normalize_url(url: str) -> str:
 
 @st.cache_data(ttl=300)
 def fetch_clickup_database(space_id: str, custom_url_field_id: str):
-  """Crawls Space strictly via Folder hierarchy.
-
-  Traverses each Folder (Client: MADX Digital, Postalytics, etc.) -> Lists -> Tasks.
-  Extracts published URLs strictly from Custom Field UUID and captures Folder IDs.
-  """
+  """Crawls Space strictly via Folder hierarchy."""
   if not CLICKUP_API_TOKEN:
     return []
 
@@ -154,11 +158,7 @@ def fetch_clickup_database(space_id: str, custom_url_field_id: str):
 
 
 def validate_clickup_duplicates(page_url: str, records: list):
-  """Scopes checks to the specific client folder owning the task:
-
-  1. Live URL must exist EXACTLY ONCE in this folder.
-  2. Root domain must exist EXACTLY ONCE in this folder.
-  """
+  """Scopes checks to the specific client folder owning the task."""
   target_norm_url = normalize_url(page_url)
   target_domain = normalize_domain(page_url)
 
@@ -303,6 +303,9 @@ def check_link_and_tags(page_url, target_url, expected_anchor, brand_name):
       "is_indexable": True,
       "is_ugc": False,
       "ugc_reason": "",
+      "ugc_ai_verified": False,
+      "ugc_ai_explanation": "",
+      "link_context_snippet": "",
       "is_redirecting": False,
       "final_destination_url": page_url,
       "listicle_top_3_pass": "N/A",
@@ -357,9 +360,12 @@ def check_link_and_tags(page_url, target_url, expected_anchor, brand_name):
 
   for element in ugc_containers:
     element_classes = set(" ".join(element.get("class", [])).lower().split())
-    if element_classes.intersection(ugc_classes):
+    matched_classes = element_classes.intersection(ugc_classes)
+    if matched_classes:
       results["is_ugc"] = True
-      results["ugc_reason"] = "UGC markup container detected."
+      results["ugc_reason"] = (
+          f"UGC markup container detected ({', '.join(matched_classes)})."
+      )
       break
 
   if not results["is_ugc"] and any(
@@ -387,6 +393,23 @@ def check_link_and_tags(page_url, target_url, expected_anchor, brand_name):
 
       if any(tag in ["nofollow", "sponsored", "ugc"] for tag in rel):
         results["is_follow"] = False
+
+      # Capture surrounding parent HTML/text context for AI UGC double-checking
+      parent_node = link.find_parent(["p", "li", "div", "article", "section"])
+      if parent_node:
+        ancestors = [
+            f"{p.name}(class={p.get('class')}, id={p.get('id')})"
+            for p in link.parents
+            if p.name in ["article", "section", "div", "main", "aside", "footer"]
+        ][:4]
+        snippet_text = " ".join(parent_node.get_text().split())[:600]
+        results["link_context_snippet"] = (
+            f"DOM Ancestry: {' > '.join(ancestors)}\n"
+            f"Anchor HTML: {str(link)}\n"
+            f"Surrounding Paragraph Text: {snippet_text}"
+        )
+      else:
+        results["link_context_snippet"] = f"Anchor HTML: {str(link)}"
       break
 
   page_title = soup.title.text.lower() if soup.title else ""
@@ -413,66 +436,201 @@ def check_link_and_tags(page_url, target_url, expected_anchor, brand_name):
   return results
 
 
-# --- 4. GOOGLE GEMINI AI RELEVANCY AGENT ---
-def analyze_relevancy_with_gemini(page_html, target_niche, business_topic):
-  """Uses Gemini 3.8 Flash to evaluate domain niche and topic alignment rules."""
-  if not gemini_client:
+# --- 4. AI RELEVANCY & UGC DOUBLE-CHECKER (GEMINI + GROQ FALLBACK) ---
+def _call_groq_relevancy_fallback(prompt: str) -> dict:
+  """Secondary AI provider fallback via Groq's OpenAI-compatible Chat Completions API."""
+  if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is not configured in secrets.")
+
+  groq_url = "https://api.groq.com/openai/v1/chat/completions"
+  headers = {
+      "Authorization": f"Bearer {GROQ_API_KEY}",
+      "Content-Type": "application/json",
+  }
+
+  system_instruction = (
+      "You are an expert SEO Quality Assurance Auditor. Respond ONLY with a valid"
+      " JSON object containing exactly five keys: 'niche_pass' ('PASS' or"
+      " 'FAIL'), 'topic_pass' ('PASS' or 'FAIL'), 'reason' (string),"
+      " 'is_actual_ugc' (boolean: true ONLY if the backlink itself is placed"
+      " inside a user comment, forum post, or unmoderated profile; false if it"
+      " is inside the main editorial article body even if a comment box exists"
+      " elsewhere on the page), and 'ugc_audit_reason' (concise string"
+      " explaining where the link sits)."
+  )
+
+  groq_models = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b"]
+  last_groq_error = ""
+
+  for model_name in groq_models:
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
+    }
+    try:
+      resp = requests.post(
+          groq_url, headers=headers, json=payload, timeout=20
+      )
+      if resp.status_code == 200:
+        content = resp.json()["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        niche_val = str(parsed.get("niche_pass", "FAIL")).upper()
+        topic_val = str(parsed.get("topic_pass", "FAIL")).upper()
+        return {
+            "niche_pass": niche_val if niche_val in ["PASS", "FAIL"] else "FAIL",
+            "topic_pass": topic_val if topic_val in ["PASS", "FAIL"] else "FAIL",
+            "reason": (
+                f"[Evaluated via Groq Fallback: {model_name}]"
+                f" {parsed.get('reason', 'No reason provided.')}"
+            ),
+            "is_actual_ugc": bool(parsed.get("is_actual_ugc", False)),
+            "ugc_audit_reason": str(
+                parsed.get("ugc_audit_reason", "Verified by Groq AI.")
+            ),
+        }
+      else:
+        last_groq_error = f"HTTP {resp.status_code}: {resp.text}"
+    except Exception as e:
+      last_groq_error = str(e)
+
+  raise RuntimeError(f"Groq fallback failed: {last_groq_error}")
+
+
+def analyze_relevancy_and_ugc_with_ai(
+    page_html, target_niche, business_topic, qa_results
+):
+  """Evaluates domain niche/topic alignment AND double-checks UGC placement flags.
+
+  1. Rotates across available Gemini models (3.8 Flash -> 2.5 Flash -> 2.5 Flash Lite -> 3.6 Flash).
+  2. Automatically falls back to Groq if Gemini hits rate limits or errors.
+  """
+  default_ugc = qa_results.get("is_ugc", False)
+  default_ugc_reason = qa_results.get("ugc_reason", "")
+
+  if not gemini_client and not GROQ_API_KEY:
     return {
         "niche_pass": "Error",
         "topic_pass": "Error",
-        "reason": "Gemini API Key missing.",
+        "reason": "Both GEMINI_API_KEY and GROQ_API_KEY are missing.",
+        "is_actual_ugc": default_ugc,
+        "ugc_audit_reason": default_ugc_reason,
     }
   if not page_html:
     return {
         "niche_pass": "Error",
         "topic_pass": "Error",
         "reason": "No HTML content was retrieved.",
+        "is_actual_ugc": default_ugc,
+        "ugc_audit_reason": default_ugc_reason,
     }
 
-  try:
-    soup = BeautifulSoup(page_html, "html.parser")
-    for script in soup(["script", "style", "nav", "footer", "header"]):
-      script.decompose()
+  soup = BeautifulSoup(page_html, "html.parser")
+  for script in soup(["script", "style", "nav", "footer", "header"]):
+    script.decompose()
 
-    pure_text = soup.get_text(separator=" ")
-    truncated_text = " ".join(pure_text.split()[:1500])
+  pure_text = soup.get_text(separator=" ")
+  truncated_text = " ".join(pure_text.split()[:1500])
 
-    prompt = f"""
-        You are an expert SEO Quality Assurance Auditor. Analyze this content to determine relevance.
-        Target Niche/Industry: {target_niche}
-        Client Business Topic/Core Product: {business_topic}
+  link_snippet = qa_results.get(
+      "link_context_snippet", "Target link node was not isolated in DOM."
+  )
+  dom_ugc_flag = (
+      f"Flagged ({default_ugc_reason})" if default_ugc else "Clean (No UGC DOM flags)"
+  )
 
-        Content:
-        \"\"\"{truncated_text}\"\"\"
+  prompt = f"""
+    You are an expert SEO Quality Assurance Auditor. Analyze this page to evaluate relevance AND verify whether the backlink placement is genuine editorial content or User-Generated Content (UGC).
 
-        Evaluate:
-        1. Niche Relevancy: Is this page contextually adjacent or relevant to '{target_niche}'?
-        2. Topic Relevancy: Does this theme make semantic sense to mention '{business_topic}'?
-        """
-    response = gemini_client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-        config=genai.types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema={
-                "type": "OBJECT",
-                "properties": {
-                    "niche_pass": {"type": "STRING", "enum": ["PASS", "FAIL"]},
-                    "topic_pass": {"type": "STRING", "enum": ["PASS", "FAIL"]},
-                    "reason": {"type": "STRING"},
+    Target Niche/Industry: {target_niche}
+    Client Business Topic/Core Product: {business_topic}
+
+    --- BACKLINK PLACEMENT CONTEXT ---
+    Automated DOM Scraper UGC Status: {dom_ugc_flag}
+    {link_snippet}
+
+    --- PAGE CONTENT (TRUNCATED) ---
+    \"\"\"{truncated_text}\"\"\"
+
+    Evaluate:
+    1. Niche Relevancy ('niche_pass'): Is this page contextually adjacent or relevant to '{target_niche}'?
+    2. Topic Relevancy ('topic_pass'): Does this theme make semantic sense to mention '{business_topic}'?
+    3. UGC Placement Audit ('is_actual_ugc'): Many standard blog templates include a 'comments-area' or 'leave a comment' box at the bottom of the page even when the article itself is editorial. Set 'is_actual_ugc' to TRUE ONLY if the target backlink itself is inside a reader comment, forum thread, or unmoderated user profile. Set 'is_actual_ugc' to FALSE if the backlink is placed inside the main editorial article body or listicle.
+    4. Provide a brief 'ugc_audit_reason' explaining whether the link is in the editorial body or a comment section.
+    """
+
+  gemini_error = "Gemini API Key not configured."
+
+  if gemini_client:
+    candidate_models = [
+        "gemini-3.8-flash",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.6-flash",
+    ]
+    for model_id in candidate_models:
+      try:
+        response = gemini_client.models.generate_content(
+            model=model_id,
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema={
+                    "type": "OBJECT",
+                    "properties": {
+                        "niche_pass": {"type": "STRING", "enum": ["PASS", "FAIL"]},
+                        "topic_pass": {"type": "STRING", "enum": ["PASS", "FAIL"]},
+                        "reason": {"type": "STRING"},
+                        "is_actual_ugc": {"type": "BOOLEAN"},
+                        "ugc_audit_reason": {"type": "STRING"},
+                    },
+                    "required": [
+                        "niche_pass",
+                        "topic_pass",
+                        "reason",
+                        "is_actual_ugc",
+                        "ugc_audit_reason",
+                    ],
                 },
-                "required": ["niche_pass", "topic_pass", "reason"],
-            },
-            temperature=0.1,
-        ),
-    )
-    return json.loads(response.text)
-  except Exception as e:
-    return {
-        "niche_pass": "Error",
-        "topic_pass": "Error",
-        "reason": f"Gemini Exception: {str(e)}",
-    }
+                temperature=0.1,
+            ),
+        )
+        result = json.loads(response.text)
+        result["reason"] = f"[Evaluated via Gemini: {model_id}] {result['reason']}"
+        result["ugc_audit_reason"] = (
+            f"[{model_id}] {result['ugc_audit_reason']}"
+        )
+        return result
+      except Exception as e:
+        gemini_error = str(e)
+        continue
+
+  if GROQ_API_KEY:
+    try:
+      return _call_groq_relevancy_fallback(prompt)
+    except Exception as groq_err:
+      return {
+          "niche_pass": "Error",
+          "topic_pass": "Error",
+          "reason": (
+              f"Primary (Gemini) failed: {gemini_error} | Secondary (Groq)"
+              f" failed: {groq_err}"
+          ),
+          "is_actual_ugc": default_ugc,
+          "ugc_audit_reason": default_ugc_reason,
+      }
+
+  return {
+      "niche_pass": "Error",
+      "topic_pass": "Error",
+      "reason": f"Gemini Exception (and no GROQ_API_KEY set): {gemini_error}",
+      "is_actual_ugc": default_ugc,
+      "ugc_audit_reason": default_ugc_reason,
+  }
 
 
 # --- 5. ADVANCED AHREFS SITEWIDE ENGINE ---
@@ -842,7 +1000,7 @@ def generate_pdf_report(
   # Section 4: Semantic AI
   elements.append(
       Paragraph(
-          "4. Semantic AI Relevancy Audit (Gemini Evaluation)", heading_style
+          "4. Semantic AI Relevancy Audit (AI Evaluation)", heading_style
       )
   )
   ai_data = [
@@ -949,7 +1107,7 @@ if submitted:
         " URL."
     )
   else:
-    # STEP 1: ClickUp Database Conflict Check (Client folder and ID resolved automatically)
+    # STEP 1: ClickUp Database Conflict Check
     with st.spinner(
         "Step 1/4: Resolving ClickUp client folder & auditing uniqueness..."
     ):
@@ -969,14 +1127,35 @@ if submitted:
     ):
       ahrefs_results = fetch_advanced_ahrefs_data(page_url)
 
-    # STEP 4: Gemini 3.8 Flash Contextual AI
+    # STEP 4: Semantic AI Relevancy & UGC Double-Check (Gemini + Groq Fallback)
     with st.spinner(
-        "Step 4/4: Running contextual semantic relevancy audits via Gemini"
-        " 3.8-flash..."
+        "Step 4/4: Running contextual relevancy & UGC placement verification"
+        " (Gemini / Groq)..."
     ):
-      ai_relevancy = analyze_relevancy_with_gemini(
-          qa_results.get("html_content", ""), target_niche, business_topic
+      ai_relevancy = analyze_relevancy_and_ugc_with_ai(
+          qa_results.get("html_content", ""),
+          target_niche,
+          business_topic,
+          qa_results,
       )
+
+      # Reconcile DOM UGC check with AI verification
+      if qa_results["is_ugc"] and ai_relevancy.get("niche_pass") != "Error":
+        if not ai_relevancy.get("is_actual_ugc", True):
+          # AI confirmed the backlink is in the editorial article, overriding DOM false positive
+          qa_results["is_ugc"] = False
+          qa_results["ugc_ai_verified"] = True
+          qa_results["ugc_reason"] = (
+              "DOM comment markup detected on page, but AI verified backlink is"
+              f" placed in main editorial content ({ai_relevancy.get('ugc_audit_reason', '')})."
+          )
+        else:
+          # AI confirmed the backlink is genuinely inside a comment/UGC section
+          qa_results["ugc_ai_verified"] = True
+          qa_results["ugc_reason"] = (
+              f"{qa_results['ugc_reason']} — AI Confirmed:"
+              f" {ai_relevancy.get('ugc_audit_reason', '')}"
+          )
 
     st.markdown("---")
     st.subheader("📊 Full System QA Verification Report")
@@ -1045,7 +1224,6 @@ if submitted:
             f" | **Folder:** `{matched_task['client_folder']}` (`{matched_task['folder_id']}`)"
         )
       else:
-        # Check Exact URL count in this folder
         if clickup_check["url_count"] == 0:
           st.warning(
               "⚠️ **Missing ClickUp Record:** This URL was not found in the"
@@ -1065,7 +1243,6 @@ if submitted:
                 f" **Folder:** `{match['client_folder']}` (`{match['folder_id']}`)"
             )
 
-        # Check Client Domain Count
         if clickup_check["domain_count"] > 1:
           st.error(
               "⚠️ **Client Domain Conflict:** Root domain"
@@ -1097,7 +1274,12 @@ if submitted:
           st.success("✅ **Redirect Check:** Clean direct destination.")
 
         if qa_results["is_ugc"]:
-          st.error(f"❌ **UGC Risk Detected:** {qa_results['ugc_reason']}")
+          st.error(f"❌ **UGC Risk Confirmed:** {qa_results['ugc_reason']}")
+        elif qa_results.get("ugc_ai_verified"):
+          st.success(
+              "✅ **Layout Check (AI Double-Checked):**"
+              f" {qa_results['ugc_reason']}"
+          )
         else:
           st.success("✅ **Layout Check:** Editorial article layout verified.")
 
@@ -1137,13 +1319,10 @@ if submitted:
         st.line_chart(data=dict(zip(dates, traffic)))
 
     # =========================================================================
-    # SECTION 4: Semantic AI Relevancy Audit (Gemini Evaluation)
+    # SECTION 4: Semantic AI Relevancy Audit
     # =========================================================================
     with st.container(border=True):
-      st.markdown(
-          "### 4️⃣ Semantic AI Relevancy Audit (Gemini Evaluation —"
-          " gemini-3.8-flash)"
-      )
+      st.markdown("### 4️⃣ Semantic AI Relevancy Audit (AI Evaluation)")
 
       r_col1, r_col2 = st.columns(2)
       with r_col1:
