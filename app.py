@@ -142,7 +142,10 @@ def fetch_clickup_database(space_id: str, custom_url_field_id: str):
 def validate_clickup_duplicates(
     page_url: str, selected_client: str, records: list
 ):
-  """Checks ClickUp for exact URL duplicates and domain collisions under the same client folder."""
+  """Validates that the live URL and client domain appear EXACTLY ONCE in ClickUp
+
+  (accounting for the current task already being logged prior to QA).
+  """
   target_norm_url = normalize_url(page_url)
   target_domain = normalize_domain(page_url)
   selected_client_key = selected_client.strip().lower()
@@ -151,23 +154,31 @@ def validate_clickup_duplicates(
   same_client_domain_matches = []
 
   for item in records:
-    # Rule 1: Exact URL collision anywhere in ClickUp
+    # Rule 1: Exact URL occurrences across ClickUp
     if item["normalized_url"] == target_norm_url:
       exact_url_matches.append(item)
 
-    # Rule 2: Same root domain under the SAME client folder
+    # Rule 2: Root domain occurrences under the SAME client folder
     if (
         item["domain"] == target_domain
         and item["client_key"] == selected_client_key
     ):
       same_client_domain_matches.append(item)
 
-  is_passed = (
-      len(exact_url_matches) == 0 and len(same_client_domain_matches) == 0
-  )
+  url_count = len(exact_url_matches)
+  domain_count = len(same_client_domain_matches)
+
+  # Must exist (count == 1) and have no duplicate repeats (count <= 1)
+  is_url_valid = url_count == 1
+  is_domain_valid = domain_count == 1
+  is_passed = is_url_valid and is_domain_valid
 
   return {
       "is_passed": is_passed,
+      "is_url_valid": is_url_valid,
+      "is_domain_valid": is_domain_valid,
+      "url_count": url_count,
+      "domain_count": domain_count,
       "target_domain": target_domain,
       "exact_url_matches": exact_url_matches,
       "same_client_domain_matches": same_client_domain_matches,
@@ -640,7 +651,7 @@ def generate_pdf_report(
           Paragraph(
               "PASS (Unique)"
               if clickup_check.get("is_passed")
-              else "FAIL (Duplicate Conflict)",
+              else "FAIL (Validation Error)",
               badge_pass if clickup_check.get("is_passed") else badge_fail,
           ),
           Paragraph(f"DR {ahrefs_results.get('dr', 'N/A')}", body_style),
@@ -668,29 +679,49 @@ def generate_pdf_report(
   elements.append(
       Paragraph("2. ClickUp Database Uniqueness Audit", heading_style)
   )
+
+  url_status_label = "PASS" if clickup_check["is_url_valid"] else "FAIL"
+  if clickup_check["url_count"] == 0:
+    url_detail_text = (
+        "Not found in ClickUp (0 occurrences). Task must be logged prior to QA."
+    )
+  elif clickup_check["url_count"] == 1:
+    url_detail_text = (
+        "Verified: Exists exactly once in ClickUp (active QA task)."
+    )
+  else:
+    url_detail_text = (
+        f"Duplicate Conflict: Found {clickup_check['url_count']} times across"
+        " ClickUp."
+    )
+
+  domain_status_label = "PASS" if clickup_check["is_domain_valid"] else "FAIL"
+  if clickup_check["domain_count"] == 0:
+    domain_detail_text = (
+        f"Domain '{clickup_check['target_domain']}' not found under"
+        f" {client_name} (0 occurrences)."
+    )
+  elif clickup_check["domain_count"] == 1:
+    domain_detail_text = (
+        f"Verified: Domain '{clickup_check['target_domain']}' exists once under"
+        f" {client_name}."
+    )
+  else:
+    domain_detail_text = (
+        f"Duplicate Conflict: Domain '{clickup_check['target_domain']}' found"
+        f" {clickup_check['domain_count']} times under {client_name}."
+    )
+
   clickup_rows = [
       ["Check Criterion", "Status", "Details / Diagnostics"],
+      ["Exact URL Count (Expected: 1)", url_status_label, url_detail_text],
       [
-          "Exact URL Duplication",
-          "FAIL" if clickup_check["exact_url_matches"] else "PASS",
-          f"Found {len(clickup_check['exact_url_matches'])} matches"
-          if clickup_check["exact_url_matches"]
-          else "No identical URL discovered across ClickUp.",
-      ],
-      [
-          f"Client Domain Conflict ({client_name})",
-          "FAIL" if clickup_check["same_client_domain_matches"] else "PASS",
-          (
-              f"Domain '{clickup_check['target_domain']}' is already used for"
-              f" {client_name}."
-              if clickup_check["same_client_domain_matches"]
-              else (
-                  f"Domain '{clickup_check['target_domain']}' is unique for"
-                  f" client {client_name}."
-              )
-          ),
+          f"Client Domain Count ({client_name})",
+          domain_status_label,
+          domain_detail_text,
       ],
   ]
+
   clickup_table_data = []
   for row in clickup_rows:
     status_p = (
@@ -831,7 +862,16 @@ def generate_pdf_report(
 st.set_page_config(
     page_title="Enterprise Link Building QA", page_icon="🔗", layout="wide"
 )
-st.title("🔗 Enterprise Link Building QA Dashboard")
+
+# Header Row with Manual Refresh Option
+head_col1, head_col2 = st.columns([4, 1])
+with head_col1:
+  st.title("🔗 Enterprise Link Building QA Dashboard")
+with head_col2:
+  st.write("")
+  if st.button("🔄 Refresh ClickUp Cache", use_container_width=True):
+    fetch_clickup_database.clear()
+    st.toast("ClickUp database cache cleared!", icon="🧹")
 
 # Pre-fetch ClickUp client folders and task database (cached 5 min)
 with st.spinner("Connecting to ClickUp Workspace..."):
@@ -916,14 +956,16 @@ if submitted:
     # SECTION 1: Audit Input Specifications & High-Level Summary
     # =========================================================================
     with st.container(border=True):
-      st.markdown(
-          "### 1️⃣ Audit Input Specifications & High-Level Summary"
-      )
+      st.markdown("### 1️⃣ Audit Input Specifications & High-Level Summary")
 
       # 4 Scorecard Metrics
       sm1, sm2, sm3, sm4 = st.columns(4)
       with sm1:
-        dupe_val = "PASS (Unique)" if clickup_check["is_passed"] else "FAIL (Conflict)"
+        dupe_val = (
+            "PASS (Unique)"
+            if clickup_check["is_passed"]
+            else "FAIL (Validation Error)"
+        )
         st.metric(label="ClickUp Uniqueness", value=dupe_val)
       with sm2:
         st.metric(label="Domain Rating", value=f"DR {ahrefs_results['dr']}")
@@ -956,16 +998,27 @@ if submitted:
 
       if clickup_check["is_passed"]:
         st.success(
-            f"✅ **Clear to place!** Domain `{clickup_check['target_domain']}`"
-            f" has not been used for client **{selected_client}**, and this exact"
-            " URL does not exist in your ClickUp database."
+            f"✅ **Verified Unique Placement!** Both the exact URL and root"
+            f" domain `{clickup_check['target_domain']}` exist **exactly"
+            f" once** under client **{selected_client}**."
+        )
+        matched_task = clickup_check["exact_url_matches"][0]
+        st.markdown(
+            f"- **Active QA Task:** [{matched_task['task_name']}]({matched_task['task_url']})"
+            f" | **Folder:** `{matched_task['client_name']}`"
         )
       else:
-        if clickup_check["exact_url_matches"]:
+        # Check Exact URL Count
+        if clickup_check["url_count"] == 0:
+          st.warning(
+              "⚠️ **Missing ClickUp Record:** This URL was not found in the"
+              " ClickUp `Published URL` field (0 occurrences). Please ensure it"
+              " is encoded in ClickUp before running QA."
+          )
+        elif clickup_check["url_count"] > 1:
           st.error(
-              "🚨 **Exact URL Duplicate Found!** This URL has already been"
-              f" logged in ClickUp ({len(clickup_check['exact_url_matches'])}"
-              " time[s]):"
+              f"🚨 **Exact URL Duplicate Found!** Expected 1 record, but found"
+              f" **{clickup_check['url_count']}** occurrences across ClickUp:"
           )
           for match in clickup_check["exact_url_matches"]:
             st.markdown(
@@ -973,11 +1026,19 @@ if submitted:
                 f" **Folder:** `{match['client_name']}`"
             )
 
-        if clickup_check["same_client_domain_matches"]:
-          st.error(
-              f"⚠️ **Client Domain Conflict:** The root domain"
-              f" `{clickup_check['target_domain']}` is already used for client"
+        # Check Client Domain Count
+        if clickup_check["domain_count"] == 0:
+          st.warning(
+              f"⚠️ **Missing Client Domain Record:** Domain"
+              f" `{clickup_check['target_domain']}` has 0 entries under client"
               f" **{selected_client}**."
+          )
+        elif clickup_check["domain_count"] > 1:
+          st.error(
+              f"⚠️ **Client Domain Conflict:** Expected 1 entry, but root"
+              f" domain `{clickup_check['target_domain']}` appears"
+              f" **{clickup_check['domain_count']}** times under client"
+              f" **{selected_client}**:"
           )
           for match in clickup_check["same_client_domain_matches"]:
             st.markdown(
@@ -1004,9 +1065,7 @@ if submitted:
           st.success("✅ **Redirect Check:** Clean direct destination.")
 
         if qa_results["is_ugc"]:
-          st.error(
-              f"❌ **UGC Risk Detected:** {qa_results['ugc_reason']}"
-          )
+          st.error(f"❌ **UGC Risk Detected:** {qa_results['ugc_reason']}")
         else:
           st.success("✅ **Layout Check:** Editorial article layout verified.")
 
@@ -1028,10 +1087,14 @@ if submitted:
             st.success("✅ **Attribution:** DoFollow link verified.")
           else:
             st.error(
-                f"❌ **Link Restricted:** Rel attributes: `{qa_results['rel_tags']}`"
+                "❌ **Link Restricted:** Rel attributes:"
+                f" `{qa_results['rel_tags']}`"
             )
         else:
-          st.error("❌ **Backlink Missing:** Target destination string was not found.")
+          st.error(
+              "❌ **Backlink Missing:** Target destination string was not"
+              " found."
+          )
 
       # Ahrefs Sitewide Metrics Chart
       if ahrefs_results["traffic_history"]:
@@ -1047,7 +1110,8 @@ if submitted:
     # =========================================================================
     with st.container(border=True):
       st.markdown(
-          "### 4️⃣ Semantic AI Relevancy Audit (Gemini Evaluation — gemini-3.8-flash)"
+          "### 4️⃣ Semantic AI Relevancy Audit (Gemini Evaluation —"
+          " gemini-3.8-flash)"
       )
 
       r_col1, r_col2 = st.columns(2)
