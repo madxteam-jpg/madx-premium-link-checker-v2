@@ -1075,7 +1075,7 @@ with st.form("qa_form"):
   col1, col2 = st.columns(2)
   with col1:
     page_url = st.text_input(
-        "Live Page URL (Where partner placed the link)",
+        "Live Page URL (Where linkbuilder placed the link)",
         placeholder="https://scrape.do/blog/sample-article",
     )
     target_url = st.text_input(
