@@ -31,7 +31,7 @@ SCRAPERANT_KEY = st.secrets.get("SCRAPERANT_KEY", "")
 
 # ClickUp Configuration
 CLICKUP_API_TOKEN = st.secrets.get("CLICKUP_API_TOKEN", "")
-CLICKUP_SPACE_ID = st.secrets.get("CLICKUP_SPACE_ID", "")
+CLICKUP_SPACE_ID = st.secrets.get("CLICKUP_SPACE_ID", "901510491615")
 CLICKUP_CUSTOM_URL_FIELD_ID = st.secrets.get(
     "CLICKUP_CUSTOM_URL_FIELD_ID", "f06c29f4-d964-4719-a37d-b283ef19f48b"
 )
