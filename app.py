@@ -31,20 +31,24 @@ SCRAPERANT_KEY = st.secrets.get("SCRAPERANT_KEY", "")
 
 # ClickUp Configuration
 CLICKUP_API_TOKEN = st.secrets.get("CLICKUP_API_TOKEN", "")
+CLICKUP_TEAM_ID = st.secrets.get("CLICKUP_TEAM_ID", "90152316361")
 CLICKUP_SPACE_ID = st.secrets.get("CLICKUP_SPACE_ID", "901510491615")
 CLICKUP_CUSTOM_URL_FIELD_ID = st.secrets.get(
     "CLICKUP_CUSTOM_URL_FIELD_ID", "f06c29f4-d964-4719-a37d-b283ef19f48b"
 )
 
-CLICKUP_HEADERS = {"Authorization": CLICKUP_API_TOKEN}
+CLICKUP_HEADERS = {
+    "Authorization": CLICKUP_API_TOKEN,
+    "Content-Type": "application/json",
+}
 
 # Initialize Gemini Client
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
-# --- 2. URL & CLICKUP DATABASE HELPERS ---
+# --- 2. URL & STRICT CLICKUP DATABASE HELPERS ---
 def normalize_domain(url: str) -> str:
-  """Extracts registered root domain (e.g., 'sub.example.co.uk' -> 'example.co.uk')."""
+  """Extracts registered root domain (e.g. 'sub.example.co.uk' -> 'example.co.uk')."""
   if not url:
     return ""
   ext = tldextract.extract(url)
@@ -63,112 +67,136 @@ def normalize_url(url: str) -> str:
 
 @st.cache_data(ttl=300)
 def fetch_clickup_database(space_id: str, custom_url_field_id: str):
-  """Pulls tasks from ClickUp Space and parses the client identity from each task's parent folder."""
-  if not CLICKUP_API_TOKEN or not space_id:
-    return [], []
+  """Crawls Space strictly via Folder hierarchy.
 
-  url = f"https://api.clickup.com/api/v2/space/{space_id}/task"
-  params = {"include_closed": "true", "subtasks": "true", "page": 0}
+  Traverses each Folder (Client: MADX Digital, Postalytics, etc.) -> Lists -> Tasks.
+  Extracts published URLs strictly from Custom Field UUID and captures Folder IDs.
+  """
+  if not CLICKUP_API_TOKEN:
+    return []
 
   records = []
-  client_folders = set()
 
-  while True:
-    try:
-      resp = requests.get(
-          url, headers=CLICKUP_HEADERS, params=params, timeout=15
+  folders_url = f"https://api.clickup.com/api/v2/space/{space_id}/folder?archived=false"
+  try:
+    f_resp = requests.get(folders_url, headers=CLICKUP_HEADERS, timeout=15)
+    if f_resp.status_code != 200:
+      st.error(
+          f"ClickUp Folder Fetch Error ({f_resp.status_code}): {f_resp.text}"
       )
-      if resp.status_code != 200:
-        break
+      return []
+    folders = f_resp.json().get("folders", [])
+  except Exception as e:
+    st.error(f"Exception fetching ClickUp folders: {e}")
+    return []
 
-      data = resp.json()
-      tasks = data.get("tasks", [])
-      if not tasks:
-        break
+  for folder in folders:
+    folder_id = folder.get("id")
+    folder_name = folder.get("name", "").strip()
+    if not folder_name:
+      continue
 
-      for task in tasks:
-        folder_info = task.get("folder") or {}
-        folder_name = folder_info.get("name")
+    lists = folder.get("lists", [])
 
-        if not folder_name:
-          continue
+    for lst in lists:
+      list_id = lst.get("id")
+      page = 0
 
-        folder_name = folder_name.strip()
-        client_folders.add(folder_name)
+      while True:
+        tasks_url = f"https://api.clickup.com/api/v2/list/{list_id}/task"
+        params = {"include_closed": "true", "subtasks": "true", "page": page}
+        try:
+          t_resp = requests.get(
+              tasks_url, headers=CLICKUP_HEADERS, params=params, timeout=15
+          )
+          if t_resp.status_code != 200:
+            break
 
-        # Retrieve URL from Custom Field (handles string, dict, or nested payload)
-        target_url = None
-        if custom_url_field_id:
-          for cf in task.get("custom_fields", []):
-            if cf.get("id") == custom_url_field_id and cf.get("value"):
-              val = cf["value"]
-              if isinstance(val, dict):
-                target_url = val.get("url") or val.get("value")
-              else:
-                target_url = str(val).strip()
-              break
+          data = t_resp.json()
+          tasks = data.get("tasks", [])
+          if not tasks:
+            break
 
-        # Fallback to description or task title if custom field was empty
-        if not target_url and task.get("description"):
-          for word in task["description"].split():
-            if word.startswith(("http://", "https://")):
-              target_url = word
-              break
+          for task in tasks:
+            target_url = None
+            for cf in task.get("custom_fields", []):
+              if cf.get("id") == custom_url_field_id:
+                val = cf.get("value")
+                if isinstance(val, dict):
+                  target_url = val.get("url") or val.get("value")
+                elif val:
+                  target_url = str(val).strip()
+                break
 
-        if not target_url and task.get("name", "").startswith(
-            ("http://", "https://")
-        ):
-          target_url = task["name"]
+            if target_url:
+              task_identifier = task.get("custom_id") or task.get("id")
+              records.append({
+                  "task_id": task_identifier,
+                  "task_name": task.get("name", "Untitled Task"),
+                  "task_url": task.get(
+                      "url", f"https://app.clickup.com/t/{task_identifier}"
+                  ),
+                  "folder_id": folder_id,
+                  "client_folder": folder_name,
+                  "client_key": folder_name.lower(),
+                  "raw_url": target_url,
+                  "normalized_url": normalize_url(target_url),
+                  "domain": normalize_domain(target_url),
+              })
 
-        if target_url:
-          records.append({
-              "task_id": task.get("id"),
-              "task_name": task.get("name", "Untitled Task"),
-              "task_url": task.get("url", "#"),
-              "client_name": folder_name,
-              "client_key": folder_name.lower(),
-              "raw_url": target_url,
-              "normalized_url": normalize_url(target_url),
-              "domain": normalize_domain(target_url),
-          })
+          page += 1
+          if page > 50:
+            break
+        except Exception:
+          break
 
-      params["page"] += 1
-    except Exception:
-      break
-
-  return records, sorted(list(client_folders))
+  return records
 
 
-def validate_clickup_duplicates(
-    page_url: str, selected_client: str, records: list
-):
-  """Validates that the live URL and client domain appear EXACTLY ONCE in ClickUp
+def validate_clickup_duplicates(page_url: str, records: list):
+  """Scopes checks to the specific client folder owning the task:
 
-  (accounting for the current task already being logged prior to QA).
+  1. Live URL must exist EXACTLY ONCE in this folder.
+  2. Root domain must exist EXACTLY ONCE in this folder.
   """
   target_norm_url = normalize_url(page_url)
   target_domain = normalize_domain(page_url)
-  selected_client_key = selected_client.strip().lower()
 
-  exact_url_matches = []
-  same_client_domain_matches = []
+  matching_url_records = [
+      r for r in records if r["normalized_url"] == target_norm_url
+  ]
 
-  for item in records:
-    # Rule 1: Exact URL occurrences across ClickUp
-    if item["normalized_url"] == target_norm_url:
-      exact_url_matches.append(item)
+  if not matching_url_records:
+    return {
+        "is_passed": False,
+        "is_url_valid": False,
+        "is_domain_valid": False,
+        "url_count": 0,
+        "domain_count": 0,
+        "detected_client": "Not Found in ClickUp",
+        "detected_folder_id": "N/A",
+        "target_domain": target_domain,
+        "client_url_matches": [],
+        "same_client_domain_matches": [],
+    }
 
-    # Rule 2: Root domain occurrences under the SAME client folder
-    if (
-        item["domain"] == target_domain
-        and item["client_key"] == selected_client_key
-    ):
-      same_client_domain_matches.append(item)
+  primary_task = matching_url_records[0]
+  detected_client_folder = primary_task["client_folder"]
+  detected_folder_id = primary_task.get("folder_id", "N/A")
+  client_key = primary_task["client_key"]
 
-  url_count = len(exact_url_matches)
+  client_url_matches = [
+      r for r in matching_url_records if r["client_key"] == client_key
+  ]
+  url_count = len(client_url_matches)
+
+  same_client_domain_matches = [
+      r
+      for r in records
+      if r["domain"] == target_domain and r["client_key"] == client_key
+  ]
   domain_count = len(same_client_domain_matches)
 
-  # Must exist (count == 1) and have no duplicate repeats (count <= 1)
   is_url_valid = url_count == 1
   is_domain_valid = domain_count == 1
   is_passed = is_url_valid and is_domain_valid
@@ -179,8 +207,10 @@ def validate_clickup_duplicates(
       "is_domain_valid": is_domain_valid,
       "url_count": url_count,
       "domain_count": domain_count,
+      "detected_client": detected_client_folder,
+      "detected_folder_id": detected_folder_id,
       "target_domain": target_domain,
-      "exact_url_matches": exact_url_matches,
+      "client_url_matches": client_url_matches,
       "same_client_domain_matches": same_client_domain_matches,
   }
 
@@ -198,24 +228,19 @@ def fetch_url_content(url):
           f"&browser=true"
       )
       ant_response = requests.get(api_endpoint, timeout=60)
-
       if ant_response.status_code == 200:
         return ant_response
       elif ant_response.status_code in [401, 403]:
         st.error(
             "❌ **ScrapingAnt API Error:** Invalid API Key or out of credits."
         )
-    except requests.exceptions.Timeout:
-      st.warning(
-          "⚠️ **ScrapingAnt Timed Out:** Falling back to secondary scrapers..."
-      )
-    except Exception as e:
-      st.warning(f"⚠️ ScrapingAnt Connection Error: {e}")
+    except Exception:
+      pass
 
   headers = {
       "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-          " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+          " like Gecko) Chrome/124.0.0.0 Safari/537.36"
       ),
       "Accept": (
           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -286,7 +311,6 @@ def check_link_and_tags(page_url, target_url, expected_anchor, brand_name):
   }
 
   response = fetch_url_content(page_url)
-
   if not response:
     results["error"] = (
         "Network Failure: Unable to connect to target domain across all"
@@ -454,7 +478,6 @@ def analyze_relevancy_with_gemini(page_html, target_niche, business_topic):
 # --- 5. ADVANCED AHREFS SITEWIDE ENGINE ---
 def fetch_advanced_ahrefs_data(target_url):
   domain = get_domain_from_url(target_url)
-
   results = {"dr": "N/A", "traffic_history": None, "keywords": [], "error": ""}
 
   if not domain:
@@ -518,12 +541,13 @@ def generate_pdf_report(
     brand_name,
     anchor_text,
     client_name,
+    folder_id,
     clickup_check,
     qa_results,
     ahrefs_results,
     ai_relevancy,
 ):
-  """Generates a downloadable PDF report summarizing all audit data including ClickUp check."""
+  """Generates a downloadable PDF report summarizing all 4 audit sections."""
   buffer = io.BytesIO()
   doc = SimpleDocTemplate(
       buffer,
@@ -601,28 +625,27 @@ def generate_pdf_report(
       )
   )
 
-  # Section 1: Target Specs & High-Level Summary
+  # Section 1: Specs & Summary
   elements.append(
       Paragraph(
           "1. Audit Input Specifications & High-Level Summary", heading_style
       )
   )
-
   spec_data = [
       [
-          Paragraph("<b>Client Folder:</b>", body_style),
-          Paragraph(client_name or "N/A", body_style),
+          Paragraph("<b>Auto-Detected Client Folder:</b>", body_style),
+          Paragraph(f"{client_name} (ID: {folder_id})", body_style),
       ],
       [
           Paragraph("<b>Live Page URL:</b>", body_style),
           Paragraph(page_url, body_style),
       ],
       [
-          Paragraph("<b>Target URL:</b>", body_style),
+          Paragraph("<b>Target Landing URL:</b>", body_style),
           Paragraph(target_url, body_style),
       ],
       [
-          Paragraph("<b>Brand Name:</b>", body_style),
+          Paragraph("<b>Customer Brand Name:</b>", body_style),
           Paragraph(brand_name or "N/A", body_style),
       ],
       [
@@ -630,7 +653,7 @@ def generate_pdf_report(
           Paragraph(anchor_text or "N/A", body_style),
       ],
   ]
-  spec_table = Table(spec_data, colWidths=[120, 420])
+  spec_table = Table(spec_data, colWidths=[160, 380])
   spec_table.setStyle(
       TableStyle([
           ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F8FAFC")),
@@ -683,16 +706,17 @@ def generate_pdf_report(
   url_status_label = "PASS" if clickup_check["is_url_valid"] else "FAIL"
   if clickup_check["url_count"] == 0:
     url_detail_text = (
-        "Not found in ClickUp (0 occurrences). Task must be logged prior to QA."
+        "Not found in ClickUp Published URL field (0 occurrences). Task must be"
+        " logged prior to QA."
     )
   elif clickup_check["url_count"] == 1:
     url_detail_text = (
-        "Verified: Exists exactly once in ClickUp (active QA task)."
+        f"Verified: Exists exactly once in folder '{client_name}'."
     )
   else:
     url_detail_text = (
-        f"Duplicate Conflict: Found {clickup_check['url_count']} times across"
-        " ClickUp."
+        f"Duplicate Conflict: Found {clickup_check['url_count']} times inside"
+        f" folder '{client_name}'."
     )
 
   domain_status_label = "PASS" if clickup_check["is_domain_valid"] else "FAIL"
@@ -703,20 +727,24 @@ def generate_pdf_report(
     )
   elif clickup_check["domain_count"] == 1:
     domain_detail_text = (
-        f"Verified: Domain '{clickup_check['target_domain']}' exists once under"
-        f" {client_name}."
+        f"Verified: Domain '{clickup_check['target_domain']}' is unique for"
+        f" folder '{client_name}'."
     )
   else:
     domain_detail_text = (
-        f"Duplicate Conflict: Domain '{clickup_check['target_domain']}' found"
-        f" {clickup_check['domain_count']} times under {client_name}."
+        f"Duplicate Conflict: Domain '{clickup_check['target_domain']}' appears"
+        f" {clickup_check['domain_count']} times under folder '{client_name}'."
     )
 
   clickup_rows = [
       ["Check Criterion", "Status", "Details / Diagnostics"],
-      ["Exact URL Count (Expected: 1)", url_status_label, url_detail_text],
       [
-          f"Client Domain Count ({client_name})",
+          f"Folder URL Count ({client_name})",
+          url_status_label,
+          url_detail_text,
+      ],
+      [
+          f"Folder Domain Count ({client_name})",
           domain_status_label,
           domain_detail_text,
       ],
@@ -747,11 +775,10 @@ def generate_pdf_report(
   elements.append(clickup_table)
   elements.append(Spacer(1, 15))
 
-  # Section 3: Technical Placement & Compliance
+  # Section 3: Technical Compliance
   elements.append(
       Paragraph("3. Technical Placement & Compliance Audit", heading_style)
   )
-
   tech_checks = [
       ["Check Item", "Status", "Details / Diagnostics"],
       [
@@ -812,7 +839,7 @@ def generate_pdf_report(
   elements.append(tech_table)
   elements.append(Spacer(1, 15))
 
-  # Section 4: Semantic AI Relevancy Audit
+  # Section 4: Semantic AI
   elements.append(
       Paragraph(
           "4. Semantic AI Relevancy Audit (Gemini Evaluation)", heading_style
@@ -852,7 +879,6 @@ def generate_pdf_report(
   )
   elements.append(ai_table)
 
-  # Build Document
   doc.build(elements)
   buffer.seek(0)
   return buffer
@@ -871,59 +897,65 @@ with head_col2:
   st.write("")
   if st.button("🔄 Refresh ClickUp Cache", use_container_width=True):
     fetch_clickup_database.clear()
-    st.toast("ClickUp database cache cleared!", icon="🧹")
+    st.toast("ClickUp database cache refreshed!", icon="🧹")
 
-# Pre-fetch ClickUp client folders and task database (cached 5 min)
-with st.spinner("Connecting to ClickUp Workspace..."):
-  clickup_records, client_folders = fetch_clickup_database(
+# Pre-fetch ClickUp database (cached 5 min)
+with st.spinner(
+    "Syncing ClickUp Workspace (traversing client folders & custom fields)..."
+):
+  clickup_records = fetch_clickup_database(
       CLICKUP_SPACE_ID, CLICKUP_CUSTOM_URL_FIELD_ID
   )
 
 with st.form("qa_form"):
   st.subheader("📋 Input Specifications")
+  st.caption(
+      "💡 *Client folder name and folder ID are auto-detected from ClickUp"
+      " using the live page URL.*"
+  )
+
   col1, col2 = st.columns(2)
   with col1:
-    if client_folders:
-      selected_client = st.selectbox(
-          "Client ClickUp Folder",
-          options=client_folders,
-          help="Client folders fetched directly from your ClickUp Workspace",
-      )
-    else:
-      selected_client = st.text_input(
-          "Client ClickUp Folder Name",
-          placeholder="e.g. Acme Corp",
-          help="Manually enter folder name if ClickUp is not connected",
-      )
-
     page_url = st.text_input(
-        "Live Page URL (Where your partner placed the link)"
+        "Live Page URL (Where partner placed the link)",
+        placeholder="https://scrape.do/blog/sample-article",
     )
-    target_url = st.text_input("Target URL (Your Client Landing Page)")
-    brand_name = st.text_input("Customer Brand Name")
+    target_url = st.text_input(
+        "Target URL (Client Landing Page)", placeholder="https://client.com/demo"
+    )
+    brand_name = st.text_input(
+        "Customer Brand Name", placeholder="e.g. Scrape.do"
+    )
   with col2:
-    anchor_text = st.text_input("Expected Anchor Text")
-    target_niche = st.text_input("Target Niche / Industry Requirements")
-    business_topic = st.text_input("Client Core Business Topic / Product")
+    anchor_text = st.text_input(
+        "Expected Anchor Text", placeholder="e.g. web scraping api"
+    )
+    target_niche = st.text_input(
+        "Target Niche / Industry", placeholder="e.g. Web Scraping, Proxy Tools"
+    )
+    business_topic = st.text_input(
+        "Client Business Topic / Core Product",
+        placeholder="e.g. Automated Data Extraction Software",
+    )
 
   submitted = st.form_submit_button("Execute Full System QA Audit")
 
 
 # --- 8. UNIFIED FORM SUBMISSION & ALL-IN-ONE REPORT VIEW ---
 if submitted:
-  if not page_url or not target_url or not selected_client:
+  if not page_url or not target_url:
     st.error(
-        "❌ Form Incomplete: Please select a Client Folder and provide both the"
-        " Live Page URL and Target URL."
+        "❌ Form Incomplete: Please provide both the Live Page URL and Target"
+        " URL."
     )
   else:
-    # STEP 1: ClickUp Database Conflict Check
+    # STEP 1: ClickUp Database Conflict Check (Client folder and ID resolved automatically)
     with st.spinner(
-        "Step 1/4: Checking ClickUp for URL & Domain duplicate conflicts..."
+        "Step 1/4: Resolving ClickUp client folder & auditing uniqueness..."
     ):
-      clickup_check = validate_clickup_duplicates(
-          page_url, selected_client, clickup_records
-      )
+      clickup_check = validate_clickup_duplicates(page_url, clickup_records)
+      detected_client = clickup_check["detected_client"]
+      detected_folder_id = clickup_check["detected_folder_id"]
 
     # STEP 2: Live HTML Scrape & DOM Parsing
     with st.spinner("Step 2/4: Scraping live page code frameworks..."):
@@ -958,7 +990,6 @@ if submitted:
     with st.container(border=True):
       st.markdown("### 1️⃣ Audit Input Specifications & High-Level Summary")
 
-      # 4 Scorecard Metrics
       sm1, sm2, sm3, sm4 = st.columns(4)
       with sm1:
         dupe_val = (
@@ -979,7 +1010,10 @@ if submitted:
       st.markdown("#### Input Target Context")
       spec_col1, spec_col2 = st.columns(2)
       with spec_col1:
-        st.markdown(f"**Client Folder:** `{selected_client}`")
+        st.markdown(
+            f"**Auto-Detected Client Folder:** `{detected_client}` (Folder ID:"
+            f" `{detected_folder_id}`)"
+        )
         st.markdown(f"**Live Page URL:** [{page_url}]({page_url})")
         st.markdown(f"**Target Landing URL:** [{target_url}]({target_url})")
       with spec_col2:
@@ -998,17 +1032,20 @@ if submitted:
 
       if clickup_check["is_passed"]:
         st.success(
-            f"✅ **Verified Unique Placement!** Both the exact URL and root"
-            f" domain `{clickup_check['target_domain']}` exist **exactly"
-            f" once** under client **{selected_client}**."
+            "✅ **Verified Unique Placement!**  \n"
+            f"- **Client Folder:** `{detected_client}` (Folder ID:"
+            f" `{detected_folder_id}`)  \n"
+            "- **Published URL:** Appears **exactly once** in this folder.  \n"
+            f"- **Domain:** `{clickup_check['target_domain']}` is unique for"
+            " this client folder."
         )
-        matched_task = clickup_check["exact_url_matches"][0]
+        matched_task = clickup_check["client_url_matches"][0]
         st.markdown(
-            f"- **Active QA Task:** [{matched_task['task_name']}]({matched_task['task_url']})"
-            f" | **Folder:** `{matched_task['client_name']}`"
+            f"- **Active Task:** [{matched_task['task_name']}]({matched_task['task_url']})"
+            f" | **Folder:** `{matched_task['client_folder']}` (`{matched_task['folder_id']}`)"
         )
       else:
-        # Check Exact URL Count
+        # Check Exact URL count in this folder
         if clickup_check["url_count"] == 0:
           st.warning(
               "⚠️ **Missing ClickUp Record:** This URL was not found in the"
@@ -1017,34 +1054,29 @@ if submitted:
           )
         elif clickup_check["url_count"] > 1:
           st.error(
-              f"🚨 **Exact URL Duplicate Found!** Expected 1 record, but found"
-              f" **{clickup_check['url_count']}** occurrences across ClickUp:"
+              "🚨 **Duplicate Published URL in Client Folder!**  \n"
+              f"Expected 1 record in folder **{detected_client}** (ID:"
+              f" `{detected_folder_id}`), but found"
+              f" **{clickup_check['url_count']}** entries:"
           )
-          for match in clickup_check["exact_url_matches"]:
+          for match in clickup_check["client_url_matches"]:
             st.markdown(
                 f"- **Task:** [{match['task_name']}]({match['task_url']}) |"
-                f" **Folder:** `{match['client_name']}`"
+                f" **Folder:** `{match['client_folder']}` (`{match['folder_id']}`)"
             )
 
         # Check Client Domain Count
-        if clickup_check["domain_count"] == 0:
-          st.warning(
-              f"⚠️ **Missing Client Domain Record:** Domain"
-              f" `{clickup_check['target_domain']}` has 0 entries under client"
-              f" **{selected_client}**."
-          )
-        elif clickup_check["domain_count"] > 1:
+        if clickup_check["domain_count"] > 1:
           st.error(
-              f"⚠️ **Client Domain Conflict:** Expected 1 entry, but root"
-              f" domain `{clickup_check['target_domain']}` appears"
-              f" **{clickup_check['domain_count']}** times under client"
-              f" **{selected_client}**:"
+              "⚠️ **Client Domain Conflict:** Root domain"
+              f" `{clickup_check['target_domain']}` appears"
+              f" **{clickup_check['domain_count']}** times in folder"
+              f" **{detected_client}**:"
           )
           for match in clickup_check["same_client_domain_matches"]:
             st.markdown(
-                f"- **Task:** [{match['task_name']}]({match['task_url']})  \n "
-                f" **Existing Live URL:** `{match['raw_url']}`  \n "
-                f" **Folder:** `{match['client_name']}`"
+                f"- **Task:** [{match['task_name']}]({match['task_url']}) |"
+                f" **Live URL:** `{match['raw_url']}`"
             )
 
     # =========================================================================
@@ -1096,7 +1128,6 @@ if submitted:
               " found."
           )
 
-      # Ahrefs Sitewide Metrics Chart
       if ahrefs_results["traffic_history"]:
         st.markdown("#### 📈 Sitewide Authority Organic Trend (Ahrefs)")
         dates = [i.get("date") for i in ahrefs_results["traffic_history"]]
@@ -1138,7 +1169,8 @@ if submitted:
         target_url=target_url,
         brand_name=brand_name,
         anchor_text=anchor_text,
-        client_name=selected_client,
+        client_name=detected_client,
+        folder_id=detected_folder_id,
         clickup_check=clickup_check,
         qa_results=qa_results,
         ahrefs_results=ahrefs_results,
